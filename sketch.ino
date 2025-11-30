@@ -12,16 +12,17 @@
 #define SCREEN_HEIGHT     64
 
 #define PIN_POT           16   // Potentiometer (ADC)
-#define PIN_SERVO         17   // Servo PWM (sesuai wiring kamu)
+#define PIN_SERVO         17   // Servo PWM (sesuai wiring)
 #define PIN_LED           2    // LED indikator feeding
 #define PIN_BUZZER        1    // Buzzer (stok hampir habis)
-#define PIN_BUTTON        21   // Push button (ke GND, pakai INPUT_PULLUP)
+#define PIN_BUTTON_FEED   21   // Push button feeding (ke GND, INPUT_PULLUP)
+#define PIN_BUTTON_REFILL 20   // Push button refill tank (ke GND, INPUT_PULLUP)
 
 // Servo angle (sesuaikan kalau perlu)
 #define SERVO_CLOSED_ANGLE  0
 #define SERVO_OPEN_ANGLE    90
 
-// Interval feeding otomatis (ms) - SEKARANG tiap 10 detik
+// Interval feeding otomatis (ms) - tiap 10 detik untuk simulasi
 const unsigned long AUTO_FEED_INTERVAL_MS = 10000; // 10 detik
 
 // ===================== Objek Global =====================
@@ -32,11 +33,18 @@ Servo feederServo;
 SemaphoreHandle_t mutexState;        // Lindungi shared state
 SemaphoreHandle_t semFeedRequest;    // Event permintaan feeding (manual/auto)
 
+// Waktu terakhir feeding otomatis dijadwalkan
+unsigned long lastAutoFeedMs = 0;
+
+// Flag global untuk buzzer (low stock)
+volatile bool g_lowStock = false;
+
 // ===================== Shared State =====================
 struct SystemState {
   float   tankLevelPercent;  // 0–100
   uint8_t feedPercent;       // 1–20, di-set dari potentiometer
   bool    isFeeding;         // true saat feeding berlangsung
+  uint32_t msToNextFeed;     // ms menuju feeding otomatis berikutnya
 };
 
 SystemState state;
@@ -45,6 +53,7 @@ SystemState state;
 void TaskInput(void *pvParameters);
 void TaskFeeder(void *pvParameters);
 void TaskDisplay(void *pvParameters);
+void TaskBuzzer(void *pvParameters);
 
 // ===================== Setup =====================
 void setup() {
@@ -55,7 +64,8 @@ void setup() {
   // Pin mode
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_BUTTON, INPUT_PULLUP); // button ke GND → aktif LOW
+  pinMode(PIN_BUTTON_FEED, INPUT_PULLUP);   // button ke GND → aktif LOW
+  pinMode(PIN_BUTTON_REFILL, INPUT_PULLUP); // button ke GND → aktif LOW
 
   digitalWrite(PIN_LED, LOW);
   digitalWrite(PIN_BUZZER, LOW);
@@ -81,9 +91,12 @@ void setup() {
   feederServo.write(SERVO_CLOSED_ANGLE);
 
   // Inisialisasi state awal
-  state.tankLevelPercent = 100.0f; // kapasitas awal 100%
-  state.feedPercent      = 10;     // default 10%
+  state.tankLevelPercent = 100.0f;               // kapasitas awal 100%
+  state.feedPercent      = 10;                   // default 10%
   state.isFeeding        = false;
+  state.msToNextFeed     = AUTO_FEED_INTERVAL_MS;
+
+  lastAutoFeedMs = millis();
 
   // Buat mutex & semaphore
   mutexState = xSemaphoreCreateMutex();
@@ -119,6 +132,17 @@ void setup() {
     0
   );
 
+  // TaskBuzzer -> Core 0 (ringan, cukup core yang sama)
+  xTaskCreatePinnedToCore(
+    TaskBuzzer,
+    "TaskBuzzer",
+    2048,
+    NULL,
+    1,
+    NULL,
+    0
+  );
+
   // TaskFeeder -> Core 1 (lebih tinggi prioritas karena menggerakkan servo)
   xTaskCreatePinnedToCore(
     TaskFeeder,
@@ -129,8 +153,6 @@ void setup() {
     NULL,
     1
   );
-
-  // setup() selesai, selanjutnya semua logika di-handle oleh task
 }
 
 void loop() {
@@ -138,43 +160,61 @@ void loop() {
   vTaskDelay(portMAX_DELAY);
 }
 
-// ===================== Task: Input (Pot + Button + Jadwal) =====================
+// ===================== Task: Input (Pot + Button + Jadwal + Refill) =====================
 void TaskInput(void *pvParameters) {
   (void) pvParameters;
 
-  unsigned long lastAutoFeedMs = millis();
-  bool lastButtonPressed = false;
+  bool lastFeedButtonPressed   = false;
+  bool lastRefillButtonPressed = false;
 
   for (;;) {
+    unsigned long now = millis();
+
     // ---- Baca potentiometer -> feedPercent (1–20%) ----
     int raw = analogRead(PIN_POT); // 0–4095
     int feedPercent = map(raw, 0, 4095, 1, 20);
     if (feedPercent < 1)  feedPercent = 1;
     if (feedPercent > 20) feedPercent = 20;
 
-    // Update ke shared state pakai mutex
-    if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(50)) == pdTRUE) {
-      state.feedPercent = (uint8_t)feedPercent;
-      xSemaphoreGive(mutexState);
-    }
+    // ---- Button feeding manual ----
+    bool feedButtonPressed = (digitalRead(PIN_BUTTON_FEED) == LOW); // aktif LOW
 
-    // ---- Baca button untuk feeding manual ----
-    bool buttonPressed = (digitalRead(PIN_BUTTON) == LOW); // aktif LOW
-
-    // Deteksi edge: dari tidak ditekan → ditekan
-    if (buttonPressed && !lastButtonPressed) {
+    if (feedButtonPressed && !lastFeedButtonPressed) {
       Serial.println("Manual feeding requested (button)");
       xSemaphoreGive(semFeedRequest);
     }
-    lastButtonPressed = buttonPressed;
+    lastFeedButtonPressed = feedButtonPressed;
 
-    // ---- Feeding otomatis berdasarkan interval (sekarang 10 detik) ----
-    unsigned long now = millis();
-    if (now - lastAutoFeedMs >= AUTO_FEED_INTERVAL_MS) {
+    // ---- Feeding otomatis berdasarkan interval ----
+    uint32_t msToNextFeed;
+    unsigned long elapsed = now - lastAutoFeedMs;
+
+    if (elapsed >= AUTO_FEED_INTERVAL_MS) {
       Serial.println("Auto feeding requested (scheduler)");
       xSemaphoreGive(semFeedRequest);
       lastAutoFeedMs = now;
+      msToNextFeed = AUTO_FEED_INTERVAL_MS;
+    } else {
+      msToNextFeed = AUTO_FEED_INTERVAL_MS - elapsed;
     }
+
+    // ---- Update feedPercent & msToNextFeed ke shared state ----
+    if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(50)) == pdTRUE) {
+      state.feedPercent   = (uint8_t)feedPercent;
+      state.msToNextFeed  = msToNextFeed;
+      xSemaphoreGive(mutexState);
+    }
+
+    // ---- Button refill tank (set tank 100%) ----
+    bool refillPressed = (digitalRead(PIN_BUTTON_REFILL) == LOW); // aktif LOW
+    if (refillPressed && !lastRefillButtonPressed) {
+      Serial.println("Refill tank requested (button)");
+      if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(100)) == pdTRUE) {
+        state.tankLevelPercent = 100.0f;
+        xSemaphoreGive(mutexState);
+      }
+    }
+    lastRefillButtonPressed = refillPressed;
 
     vTaskDelay(pdMS_TO_TICKS(100)); // 100ms
   }
@@ -185,12 +225,11 @@ void TaskFeeder(void *pvParameters) {
   (void) pvParameters;
 
   for (;;) {
-    // Tunggu permintaan feeding (manual/jadwal)
     if (xSemaphoreTake(semFeedRequest, portMAX_DELAY) == pdTRUE) {
       uint8_t localFeedPercent = 0;
       float   localTankLevel   = 0.0f;
 
-      // Ambil data yang diperlukan dari shared state (pakai mutex)
+      // Ambil data yang diperlukan dari shared state
       if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(100)) == pdTRUE) {
         localFeedPercent = state.feedPercent;
         localTankLevel   = state.tankLevelPercent;
@@ -198,36 +237,28 @@ void TaskFeeder(void *pvParameters) {
         xSemaphoreGive(mutexState);
       }
 
-      // Kalau tank kosong, boleh kasih warning
-      if (localTankLevel <= 0.0f) {
-        Serial.println("Tank empty, feeding skipped!");
-        // kembalikan status isFeeding ke false
-        if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(100)) == pdTRUE) {
-          state.isFeeding = false;
-          xSemaphoreGive(mutexState);
-        }
-        continue;
-      }
-
       Serial.print("Feeding ");
       Serial.print(localFeedPercent);
-      Serial.println("% ...");
+      Serial.println("% ... (request accepted)");
 
       // Nyalakan LED indikator
       digitalWrite(PIN_LED, HIGH);
 
       // Gerakkan servo: open -> hold -> close
-      // Lama buka servo disesuaikan dengan feedPercent
-      int openTimeMs = 300 + localFeedPercent * 70; // contoh rumus sederhana
+      int openTimeMs = 300 + localFeedPercent * 70;
 
       feederServo.write(SERVO_OPEN_ANGLE);
       vTaskDelay(pdMS_TO_TICKS(openTimeMs));
       feederServo.write(SERVO_CLOSED_ANGLE);
       vTaskDelay(pdMS_TO_TICKS(300));
 
-      // Update tank level berdasarkan feedPercent
+      // Hitung tank level baru (clamp minimal 0)
       float newTankLevel = localTankLevel - (float)localFeedPercent;
       if (newTankLevel < 0.0f) newTankLevel = 0.0f;
+
+      if (newTankLevel == 0.0f) {
+        Serial.println("Tank is now EMPTY after this feeding.");
+      }
 
       // Tulis balik ke shared state
       if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -246,37 +277,34 @@ void TaskFeeder(void *pvParameters) {
   }
 }
 
-// ===================== Task: Display (OLED + Buzzer) =====================
+// ===================== Task: Display (OLED) =====================
 void TaskDisplay(void *pvParameters) {
   (void) pvParameters;
 
   for (;;) {
-    float   tankLevel   = 0.0f;
-    uint8_t feedPercent = 0;
-    bool    isFeeding   = false;
+    float   tankLevel      = 0.0f;
+    uint8_t feedPercent    = 0;
+    bool    isFeeding      = false;
+    uint32_t msToNextFeed  = 0;
 
-    // Ambil snapshot state
     if (xSemaphoreTake(mutexState, pdMS_TO_TICKS(50)) == pdTRUE) {
-      tankLevel   = state.tankLevelPercent;
-      feedPercent = state.feedPercent;
-      isFeeding   = state.isFeeding;
+      tankLevel      = state.tankLevelPercent;
+      feedPercent    = state.feedPercent;
+      isFeeding      = state.isFeeding;
+      msToNextFeed   = state.msToNextFeed;
       xSemaphoreGive(mutexState);
     }
 
-    // ---- Buzzer: bunyi kalau kapasitas < 15% ----
-    if (tankLevel < 15.0f) {
-      tone(PIN_BUZZER, 2000);  // 2kHz
-    } else {
-      noTone(PIN_BUZZER);
-      digitalWrite(PIN_BUZZER, LOW);
-    }
+    // Set flag global untuk buzzer (dipakai TaskBuzzer)
+    g_lowStock = (tankLevel < 15.0f);
 
-    // ---- Update OLED ----
+    uint16_t secToNextFeed = msToNextFeed / 1000;
+
     display.clearDisplay();
     display.setCursor(0, 0);
     display.setTextSize(1);
 
-    display.println("Fish Feeder v1.0");
+    display.println("Fish Feeder v1.4");
     display.println("----------------");
 
     display.print("Tank : ");
@@ -287,14 +315,16 @@ void TaskDisplay(void *pvParameters) {
     display.print(feedPercent);
     display.println(" %/feed");
 
+    display.print("Next : ");
+    display.print(secToNextFeed);
+    display.println(" s");
+
     display.print("Status: ");
     if (isFeeding) {
       display.println("FEEDING");
     } else {
       display.println("IDLE");
     }
-
-    display.print("Mode : Auto+Manual");
 
     if (tankLevel < 15.0f) {
       display.setCursor(0, 48);
@@ -305,5 +335,24 @@ void TaskDisplay(void *pvParameters) {
     display.display();
 
     vTaskDelay(pdMS_TO_TICKS(500)); // refresh tiap 500ms
+  }
+}
+
+// ===================== Task: Buzzer (bunyi saat low stock) =====================
+void TaskBuzzer(void *pvParameters) {
+  (void) pvParameters;
+
+  for (;;) {
+    if (g_lowStock) {
+      // Toggle cepat ~500 Hz: 1ms HIGH + 1ms LOW
+      digitalWrite(PIN_BUZZER, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(1));
+      digitalWrite(PIN_BUZZER, LOW);
+      vTaskDelay(pdMS_TO_TICKS(1));
+    } else {
+      // Pastikan buzzer mati, cek lagi nanti
+      digitalWrite(PIN_BUZZER, LOW);
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
   }
 }
